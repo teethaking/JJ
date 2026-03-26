@@ -6,11 +6,11 @@
 
 export interface DustBalanceInput {
   id: string
-  asset: string        // contract address (StarkNet) or asset code (Stellar)
+  asset: string        // contract address (StarkNet/Ethereum) or asset code (Stellar)
   symbol: string
   amount: number
   usdValue: number
-  network: 'starknet' | 'stellar'
+  network: 'starknet' | 'stellar' | 'ethereum'
 }
 
 export interface ValidationResult {
@@ -83,8 +83,14 @@ export function validateAmount(amount: number, balance: number): ValidationResul
  */
 export function validateTokenAddress(
   address: string,
-  network: 'starknet' | 'stellar'
+  network: 'starknet' | 'stellar' | 'ethereum'
 ): ValidationResult {
+  if (network === 'ethereum') {
+    // Allow any recognized address for now, infrastructure-specific allowlist
+    // can be added later.
+    return { valid: true, errors: [] }
+  }
+
   const allowlist = network === 'starknet' ? STARKNET_ALLOWLIST : STELLAR_ALLOWLIST
   if (!allowlist.has(address)) {
     return {
@@ -100,20 +106,28 @@ export function validateTokenAddress(
 /**
  * Validates the destination wallet address for the given network.
  */
+export function validateEthereumAddress(addr: string): boolean {
+  return /^0x[a-fA-F0-9]{40}$/.test(addr)
+}
+
 export function validateDestinationAddress(
   address: string,
-  network: 'starknet' | 'stellar'
+  network: 'starknet' | 'stellar' | 'ethereum'
 ): ValidationResult {
   const isValid =
     network === 'stellar'
       ? validateStellarAddress(address)
-      : validateStarknetAddress(address)
+      : network === 'starknet'
+        ? validateStarknetAddress(address)
+        : validateEthereumAddress(address)
 
   if (!isValid) {
     const expected =
       network === 'stellar'
         ? 'Stellar address must be a G... public key (56 characters, base32)'
-        : 'StarkNet address must be a 0x hex string'
+        : network === 'starknet'
+          ? 'StarkNet address must be a 0x hex string'
+          : 'Ethereum address must be a 0x-prefixed 40-hex-character string'
     return { valid: false, errors: [expected] }
   }
 
