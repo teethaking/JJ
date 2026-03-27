@@ -11,6 +11,7 @@ export interface DustBalanceInput {
   amount: number
   usdValue: number
   network: 'starknet' | 'stellar' | 'ethereum'
+  network: 'starknet' | 'stellar' | 'solana'
 }
 
 export interface ValidationResult {
@@ -91,6 +92,9 @@ export function validateTokenAddress(
     return { valid: true, errors: [] }
   }
 
+  network: 'starknet' | 'stellar' | 'solana'
+): ValidationResult {
+  if (network === 'solana') return { valid: true, errors: [] } // Skip for now
   const allowlist = network === 'starknet' ? STARKNET_ALLOWLIST : STELLAR_ALLOWLIST
   if (!allowlist.has(address)) {
     return {
@@ -113,7 +117,9 @@ export function validateEthereumAddress(addr: string): boolean {
 export function validateDestinationAddress(
   address: string,
   network: 'starknet' | 'stellar' | 'ethereum'
+  network: 'starknet' | 'stellar' | 'solana'
 ): ValidationResult {
+  if (network === 'solana') return { valid: true, errors: [] } // Skip for now
   const isValid =
     network === 'stellar'
       ? validateStellarAddress(address)

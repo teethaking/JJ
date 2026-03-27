@@ -42,6 +42,7 @@ import {
   APP_LOGO_URL,
   DUST_AGGREGATOR_CONTRACT,
 } from '@/config/env'
+import { getTokenPrices } from '@/lib/prices'
 
 import { validateBatch, buildTransactionSummary } from '@/lib/validation'
 import { createStellarContract, StellarContract } from '@/lib/stellar/contract'
@@ -85,6 +86,103 @@ import {
 
 const DEFAULT_MIN_THRESHOLD = 0.01
 const LOCALSTORAGE_THRESHOLD_KEY = 'dustAggregator_minThreshold'
+
+// Rate limiting configuration
+const REFRESH_DEBOUNCE_MS = 10000 // 10 seconds minimum between manual refreshes
+const CACHE_TTL_MS = 30000 // 30 seconds cache for Horizon and RPC calls
+const MAX_RETRIES = 3
+const INITIAL_BACKOFF_MS = 1000 // 1 second initial backoff
+const MAX_BACKOFF_MS = 30000 // 30 seconds max backoff
+
+// ─── Cache Types ────────────────────────────────────────────────────────────────
+
+interface CacheEntry<T> {
+  data: T
+  timestamp: number
+}
+
+// Simple in-memory cache for API responses
+class ApiCache<T> {
+  private cache = new Map<string, CacheEntry<T>>()
+
+  get(key: string): T | null {
+    const entry = this.cache.get(key)
+    if (!entry) return null
+    if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
+      this.cache.delete(key)
+      return null
+    }
+    return entry.data
+  }
+
+  set(key: string, data: T): void {
+    this.cache.set(key, { data, timestamp: Date.now() })
+  }
+
+  clear(): void {
+    this.cache.clear()
+  }
+}
+
+// Global cache instances
+const starknetBalanceCache = new ApiCache<Record<string, number>>()
+const stellarBalanceCache = new ApiCache<StellarBalance[]>()
+
+// ─── Rate Limiting Helpers ─────────────────────────────────────────────────────
+
+interface RateLimitResponse {
+  allowed: boolean
+  remaining: number
+  resetIn: number
+}
+
+async function checkRateLimit(): Promise<RateLimitResponse> {
+  try {
+    const res = await fetch('/api/rate-limit', { method: 'POST' })
+    const data = await res.json()
+    return data as RateLimitResponse
+  } catch (error) {
+    // If rate limit endpoint fails, allow the request
+    console.warn('Rate limit check failed, allowing request:', error)
+    return { allowed: true, remaining: 30, resetIn: 60 }
+  }
+}
+
+// Exponential backoff for failed API requests
+async function fetchWithBackoff(
+  fetchFn: () => Promise<unknown>,
+  maxRetries: number = MAX_RETRIES,
+  initialDelay: number = INITIAL_BACKOFF_MS
+): Promise<unknown> {
+  let lastError: Error | null = null
+  let delay = initialDelay
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fetchFn()
+    } catch (error) {
+      lastError = error as Error
+      console.warn(`Attempt ${attempt + 1} failed, retrying in ${delay}ms...`, error)
+      await new Promise(resolve => setTimeout(resolve, delay))
+      delay = Math.min(delay * 2, MAX_BACKOFF_MS)
+    }
+  }
+
+  throw lastError || new Error('Max retries exceeded')
+}
+
+// Check if refresh is allowed (debounce)
+function canRefresh(lastRefreshTime: number | null): { allowed: boolean; remainingSeconds: number } {
+  if (!lastRefreshTime) return { allowed: true, remainingSeconds: 0 }
+  
+  const elapsed = Date.now() - lastRefreshTime
+  if (elapsed >= REFRESH_DEBOUNCE_MS) return { allowed: true, remainingSeconds: 0 }
+  
+  return {
+    allowed: false,
+    remainingSeconds: Math.ceil((REFRESH_DEBOUNCE_MS - elapsed) / 1000)
+  }
+}
 
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
@@ -490,7 +588,7 @@ const useDustAggregator = (
 
 // ─── CardSection ──────────────────────────────────────────────────────────────
 
-const CardSection: React.FC<{
+interface CardSectionProps {
   token: string
   tokenShort: string
   price: number
@@ -498,7 +596,9 @@ const CardSection: React.FC<{
   onSelectionChange: (selected: boolean) => void
   belowThreshold: boolean
   minThreshold: number
-}> = ({ token, tokenShort, price, isSelected, onSelectionChange, belowThreshold, minThreshold }) => (
+}
+
+const CardSection = ({ token, tokenShort, price, isSelected, onSelectionChange, belowThreshold, minThreshold }: CardSectionProps) => (
   <Card className={`p-2 mb-2 transition-opacity duration-200 ${belowThreshold ? 'opacity-40 grayscale' : 'opacity-100'}`}>
     <CardHeader>
       <CardTitle className="flex items-center gap-2">
@@ -538,10 +638,12 @@ const CardSection: React.FC<{
 
 // ─── ThresholdSettings ────────────────────────────────────────────────────────
 
-const ThresholdSettings: React.FC<{
+interface ThresholdSettingsProps {
   minThreshold: number
   onThresholdChange: (value: number) => void
-}> = ({ minThreshold, onThresholdChange }) => {
+}
+
+const ThresholdSettings = ({ minThreshold, onThresholdChange }: ThresholdSettingsProps) => {
   const [open, setOpen] = useState(false)
   const [inputValue, setInputValue] = useState(String(minThreshold))
 
@@ -575,7 +677,13 @@ const ThresholdSettings: React.FC<{
 
 // ─── EligibilityBanner ────────────────────────────────────────────────────────
 
-const EligibilityBanner: React.FC<{ eligible: number; total: number; minThreshold: number }> = ({ eligible, total, minThreshold }) => {
+interface EligibilityBannerProps {
+  eligible: number
+  total: number
+  minThreshold: number
+}
+
+const EligibilityBanner = ({ eligible, total, minThreshold }: EligibilityBannerProps) => {
   if (total === 0) return null
   const allEligible = eligible === total
   const noneEligible = eligible === 0
@@ -594,6 +702,10 @@ const EligibilityBanner: React.FC<{ eligible: number; total: number; minThreshol
 
 export default function WalletBalances() {
   const [solanaAddress, setSolanaAddress] = useState<string | null>(null)
+  const [solanaWallet, setSolanaWallet] = useState<SolanaWalletAdapter | null>(null)
+  const [solanaConnection, setSolanaConnection] = useState<Connection | null>(null)
+  const [solanaBalances, setSolanaBalances] = useState<SplDustToken[]>([])
+  const [allbridgeSupported, setAllbridgeSupported] = useState<boolean | null>(null)
   const [starknetBalances, setStarknetBalances] = useState<Balances>({})
   const [stellarBalances, setStellarBalances] = useState<StellarBalance[]>([])
   const [starknetAddress, setStarknetAddress] = useState<string | null>(null)
@@ -602,6 +714,30 @@ export default function WalletBalances() {
   const [stellarAccountError, setStellarAccountError] = useState<'not_found' | 'rate_limit' | 'maintenance' | null>(null)
   const [stellarGeneralError, setStellarGeneralError] = useState<string | null>(null)
   const [isLoadingFriendbot, setIsLoadingFriendbot] = useState(false)
+  const [tokenPrices, setTokenPrices] = useState<Record<string, number>>({})
+  const [isFetchingPrices, setIsFetchingPrices] = useState(false)
+
+  const fetchPrices = useCallback(async () => {
+    setIsFetchingPrices(true)
+    try {
+      const symbols = ['ETH', 'STRK', 'USDC', 'USDT', 'DAI', 'WBTC', 'XLM']
+      const prices = await getTokenPrices(symbols)
+      setTokenPrices(prices)
+    } finally {
+      setIsFetchingPrices(false)
+    }
+  }, [])
+
+  // Rate limiting state
+  const [lastRefreshTime, setLastRefreshTime] = useState<number | null>(null)
+  const [rateLimitedUntil, setRateLimitedUntil] = useState<number | null>(null)
+  const [isRefreshing, setIsRefreshing] = useState(false)
+
+  // Missing state variables (existing code issue - adding for rate limiting to work)
+  const [allbridgeSupported, setAllbridgeSupported] = useState<boolean | null>(null)
+  const [solanaBalances, setSolanaBalances] = useState<SplDustToken[]>([])
+  const [solanaWallet, setSolanaWallet] = useState<SolanaWalletAdapter | null>(null)
+  const [solanaConnection, setSolanaConnection] = useState<Connection | null>(null)
 
   const [minThreshold, setMinThreshold] = useState<number>(() => {
     if (typeof window === 'undefined') return DEFAULT_MIN_THRESHOLD
@@ -623,6 +759,21 @@ export default function WalletBalances() {
   // END TEMP TEST
 
   const fetchStarknetBalances = async () => {
+    // Check rate limit
+    const rateLimit = await checkRateLimit()
+    if (!rateLimit.allowed) {
+      setRateLimitedUntil(Date.now() + rateLimit.resetIn * 1000)
+      console.warn('Rate limited - cannot fetch Starknet balances')
+      return
+    }
+
+    // Check cache
+    const cached = starknetBalanceCache.get('starknet-balances')
+    if (cached) {
+      setStarknetBalances(cached)
+      return
+    }
+
     try {
       const provider = new RpcProvider({ nodeUrl: 'https://starknet-sepolia.public.blastapi.io' })
       const { wallet } = await connectStarknet({
@@ -634,25 +785,50 @@ export default function WalletBalances() {
       const address = w.selectedAddress || w.selectedAccount?.address || w.account?.address
       setStarknetAddress(address ?? null)
       if (!address) return
-      const balancesObj: Balances = {}
-      for (const [, token] of Object.entries(TOKENS)) {
-        const contract = createStarknetContract(token.address, provider)
-        const result = await contract.balanceOf(address)
-        const balance = uint256.uint256ToBN(result.balance as Parameters<typeof uint256.uint256ToBN>[0])
-        balancesObj[token.symbol] = Number(balance.toString()) / 10 ** token.decimals
-      }
+
+      // Use exponential backoff for balance fetching
+      const balancesObj = await fetchWithBackoff(async () => {
+        const result: Balances = {}
+        for (const [, token] of Object.entries(TOKENS)) {
+          const contract = createStarknetContract(token.address, provider)
+          const balanceResult = await contract.balanceOf(address)
+          const balance = uint256.uint256ToBN(balanceResult.balance as Parameters<typeof uint256.uint256ToBN>[0])
+          result[token.symbol] = Number(balance.toString()) / 10 ** token.decimals
+        }
+        return result
+      }) as Balances
+
       setStarknetBalances(balancesObj)
+      await fetchPrices()
+      starknetBalanceCache.set('starknet-balances', balancesObj)
+      setLastRefreshTime(Date.now())
+      setRateLimitedUntil(null)
     } catch (error) {
       console.error('Error connecting to Starknet:', error)
     }
   }
 
   const fetchStellarBalances = async () => {
+    // Check rate limit
+    const rateLimit = await checkRateLimit()
+    if (!rateLimit.allowed) {
+      setRateLimitedUntil(Date.now() + rateLimit.resetIn * 1000)
+      console.warn('Rate limited - cannot fetch Stellar balances')
+      return
+    }
+
+    // Check cache
+    const cached = stellarBalanceCache.get('stellar-balances')
+    if (cached) {
+      setStellarBalances(cached)
+      return
+    }
+
     try {
       const kit = initStellarKit()
       return new Promise<void>((resolve, reject) => {
         kit.openModal({
-          onWalletSelected: async (wallet) => {
+          onWalletSelected: async (wallet: { id: string }) => {
             try {
               kit.setWallet(wallet.id)
               const { address } = await kit.getAddress()
@@ -661,6 +837,20 @@ export default function WalletBalances() {
               if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`)
               const data = await res.json()
               setStellarBalances(data.balances || [])
+              await fetchPrices()
+              
+              // Use exponential backoff for Horizon API calls
+              const data = await fetchWithBackoff(async () => {
+                const res = await fetch(`https://horizon-testnet.stellar.org/accounts/${address}`)
+                if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`)
+                return res.json()
+              }) as { balances?: StellarBalance[] }
+              
+              const balances = data.balances || []
+              setStellarBalances(balances)
+              stellarBalanceCache.set('stellar-balances', balances)
+              setLastRefreshTime(Date.now())
+              setRateLimitedUntil(null)
               resolve()
             } catch (err) {
               console.error('Error in onWalletSelected:', err)
@@ -705,9 +895,10 @@ export default function WalletBalances() {
       process.env.NEXT_PUBLIC_SOLANA_RPC_URL ?? 'https://api.devnet.solana.com'
     const connection = new Connection(rpcUrl, 'finalized')
 
-    setSolanaAddress(solana.publicKey.toBase58())
-    setSolanaWallet(solana)
-    setSolanaConnection(connection)
+      setSolanaAddress(solana.publicKey.toBase58())
+      setSolanaWallet(solana)
+      setSolanaConnection(connection)
+      await fetchPrices()
 
     // Fetch SPL token accounts for this wallet via RPC
     // getParsedTokenAccountsByOwner returns all non-zero token accounts
@@ -753,24 +944,47 @@ export default function WalletBalances() {
   const calculateTotalSelectedValue = (): number => {
     let total = 0
     Object.entries(starknetBalances).forEach(([symbol, amount]) => {
-      if (selectedTokens.has(`starknet-${symbol}`)) total += amount
+      if (selectedTokens.has(`starknet-${symbol}`)) {
+        total += amount * (tokenPrices[symbol] || 1)
+      }
     })
     stellarBalances.forEach((bal, idx) => {
-      if (selectedTokens.has(`stellar-${idx}`)) total += parseFloat(bal.balance)
+      if (selectedTokens.has(`stellar-${idx}`)) {
+        const symbol = bal.asset_type === 'native' ? 'XLM' : bal.asset_code || 'Unknown'
+        total += parseFloat(bal.balance) * (tokenPrices[symbol] || 1)
+      }
     })
     return total
   }
 
   const allTokenRows = [
-    ...Object.entries(starknetBalances).map(([symbol, amount]) => ({
-      id: `starknet-${symbol}`, symbol, shortSymbol: symbol,
-      price: Number(amount.toFixed(4)), usdValue: amount, network: 'starknet' as const,
-    })),
+    ...Object.entries(starknetBalances).map(([symbol, amount]) => {
+      const price = tokenPrices[symbol] || 1
+      const usdValue = amount * price
+      return {
+        id: `starknet-${symbol}`,
+        symbol,
+        shortSymbol: symbol,
+        amount,
+        price: Number(usdValue.toFixed(4)),
+        usdValue,
+        network: 'starknet' as const,
+      }
+    }),
     ...stellarBalances.map((bal, idx) => {
       const symbol = bal.asset_type === 'native' ? 'XLM' : bal.asset_code || 'Unknown'
       const shortSymbol = bal.asset_type === 'native' ? 'XLM' : bal.asset_code || '??'
-      const price = Number(parseFloat(bal.balance).toFixed(4))
-      return { id: `stellar-${idx}`, symbol, shortSymbol, price, usdValue: price, network: 'stellar' as const }
+      const amount = parseFloat(bal.balance)
+      const price = tokenPrices[symbol] || 1
+      const usdValue = amount * price
+      return {
+        id: `stellar-${idx}`,
+        symbol,
+        shortSymbol,
+        price: Number(usdValue.toFixed(4)),
+        usdValue,
+        network: 'stellar' as const,
+      }
     }),
   ]
 
@@ -782,29 +996,32 @@ export default function WalletBalances() {
     Object.entries(starknetBalances).forEach(([symbol, amount]) => {
       const tokenId = `starknet-${symbol}`
       if (selectedTokens.has(tokenId)) {
-        dustBalances.push({ id: tokenId, asset: TOKENS[symbol]?.address || symbol, symbol, amount, usdValue: amount, network: 'starknet' })
+        const price = tokenPrices[symbol] || 1
+        dustBalances.push({ id: tokenId, asset: TOKENS[symbol]?.address || symbol, symbol, amount, usdValue: amount * price, network: 'starknet' })
       }
     })
     stellarBalances.forEach((bal, idx) => {
       const tokenId = `stellar-${idx}`
       if (selectedTokens.has(tokenId)) {
         const symbol = bal.asset_type === 'native' ? 'XLM' : bal.asset_code || 'Unknown'
-        dustBalances.push({ id: tokenId, asset: bal.asset_code || 'XLM', symbol, amount: parseFloat(bal.balance), usdValue: parseFloat(bal.balance), network: 'stellar' })
+        const price = tokenPrices[symbol] || 1
+        dustBalances.push({ id: tokenId, asset: bal.asset_code || 'XLM', symbol, amount: parseFloat(bal.balance), usdValue: parseFloat(bal.balance) * price, network: 'stellar' })
       }
     })
     solanaBalances.forEach((token, idx) => {
-  const tokenId = `solana-${idx}`
-  if (selectedTokens.has(tokenId)) {
-    dustBalances.push({
-      id: tokenId,
-      asset: token.mint,
-      symbol: token.symbol,
-      amount: Number(token.amountRaw) / 10 ** token.decimals,
-      usdValue: token.usdValue,
-      network: 'solana',
+      const tokenId = `solana-${idx}`
+      if (selectedTokens.has(tokenId)) {
+        const price = tokenPrices[token.symbol] || 1
+        dustBalances.push({
+          id: tokenId,
+          asset: token.mint,
+          symbol: token.symbol,
+          amount: Number(token.amountRaw) / 10 ** token.decimals,
+          usdValue: (Number(token.amountRaw) / 10 ** token.decimals) * price,
+          network: 'solana',
+        })
+      }
     })
-  }
-})
     return dustBalances
   }
 
@@ -878,7 +1095,47 @@ export default function WalletBalances() {
       <div className="flex flex-wrap max-w-full gap-4">
         <Button className="w-auto bg-card text-foreground" onClick={fetchStarknetBalances}>Connect Starknet Wallet</Button>
         <Button className="w-auto bg-card text-foreground" onClick={fetchStellarBalances}>Connect Stellar Wallet</Button>
+        <Button className="w-auto bg-card text-foreground" onClick={fetchPrices} disabled={isFetchingPrices}>
+          {isFetchingPrices ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Settings2 className="w-4 h-4 mr-2" />}
+          Refresh Prices
+        
+        {/* Refresh button with debounce and rate limiting */}
+        <Button 
+          className="w-auto bg-card text-foreground"
+          onClick={async () => {
+            const refreshCheck = canRefresh(lastRefreshTime)
+            if (!refreshCheck.allowed) {
+              console.warn(`Please wait ${refreshCheck.remainingSeconds} seconds before refreshing`)
+              return
+            }
+            
+            setIsRefreshing(true)
+            setLastRefreshTime(Date.now())
+            
+            // Refresh all connected wallets
+            if (starknetAddress) {
+              await fetchStarknetBalances()
+            }
+            if (stellarAddress) {
+              await fetchStellarBalances()
+            }
+            
+            setIsRefreshing(false)
+          }}
+          disabled={isRefreshing || (!starknetAddress && !stellarAddress)}
+        > 
+          {isRefreshing ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
+          {isRefreshing ? 'Refreshing...' : 'Refresh'}
+        </Button>
       </div>
+
+      {/* Rate limited message */}
+      {rateLimitedUntil && (
+        <div className="flex items-center gap-2 text-yellow-600 text-sm bg-yellow-50 px-3 py-2 rounded-lg">
+          <AlertCircle className="w-4 h-4" />
+          <span>Rate limited — try again in {Math.ceil((rateLimitedUntil - Date.now()) / 1000)} seconds</span>
+        </div>
+      )}
 
       {hasBalances ? (
         <>
@@ -916,6 +1173,13 @@ export default function WalletBalances() {
               </>
             )}
           </ScrollArea>
+          
+          {/* Last updated indicator */}
+          {lastRefreshTime && (
+            <div className="text-sm text-muted-foreground mt-2">
+              Last updated: {Math.floor((Date.now() - lastRefreshTime) / 1000)} seconds ago
+            </div>
+          )}
         </>
       ) : (
         <p className="text-center text-gray-400">Connect wallet to see your balances</p>

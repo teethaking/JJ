@@ -6,11 +6,13 @@ import { Card, CardContent, CardTitle } from '@/components/ui/card'
 import { BorderBeam } from '@/components/magicui/border-beam'
 import StellarWalletButton from './StellarWallet'
 import StarknetWalletButton from './StarknetWallet'
+import { SolanaWalletButton } from './SolanaWallet'
 import ScrollComponent from './ScrollIn'
 
 export default function CollectDustComponent() {
   return (
     <div>
+      {/* Stellar Wallet */}
       <Card className="relative overflow-hidden p-2 mb-2">
         <CardContent className=" flex items-center justify-between ">
           <div>
@@ -24,6 +26,7 @@ export default function CollectDustComponent() {
         <BorderBeam duration={8} size={100} />
       </Card>
 
+      {/* Starknet Wallet */}
       <Card className="relative overflow-hidden p-2 mb-2">
         <CardContent className=" flex items-center justify-between ">
           <div>
@@ -37,6 +40,21 @@ export default function CollectDustComponent() {
         <BorderBeam duration={8} size={100} />
       </Card>
 
+      {/* Solana Wallet (New!) */}
+      <Card className="relative overflow-hidden p-2 mb-2">
+        <CardContent className=" flex items-center justify-between ">
+          <div>
+            <CardTitle>Solana Wallet</CardTitle>
+          </div>
+          <div>
+            <SolanaWalletButton />
+          </div>
+        </CardContent>
+
+        <BorderBeam duration={8} size={100} />
+      </Card>
+
+      {/* Ethereum Wallet */}
       <Card className="relative overflow-hidden p-2 mb-2">
         <CardContent className=" flex items-center justify-between ">
           <div>
