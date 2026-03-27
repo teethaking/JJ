@@ -10,7 +10,7 @@ export interface DustBalanceInput {
   symbol: string
   amount: number
   usdValue: number
-  network: 'starknet' | 'stellar'
+  network: 'starknet' | 'stellar' | 'solana'
 }
 
 export interface ValidationResult {
@@ -83,8 +83,9 @@ export function validateAmount(amount: number, balance: number): ValidationResul
  */
 export function validateTokenAddress(
   address: string,
-  network: 'starknet' | 'stellar'
+  network: 'starknet' | 'stellar' | 'solana'
 ): ValidationResult {
+  if (network === 'solana') return { valid: true, errors: [] } // Skip for now
   const allowlist = network === 'starknet' ? STARKNET_ALLOWLIST : STELLAR_ALLOWLIST
   if (!allowlist.has(address)) {
     return {
@@ -102,8 +103,9 @@ export function validateTokenAddress(
  */
 export function validateDestinationAddress(
   address: string,
-  network: 'starknet' | 'stellar'
+  network: 'starknet' | 'stellar' | 'solana'
 ): ValidationResult {
+  if (network === 'solana') return { valid: true, errors: [] } // Skip for now
   const isValid =
     network === 'stellar'
       ? validateStellarAddress(address)
